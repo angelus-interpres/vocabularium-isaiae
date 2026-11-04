@@ -63,6 +63,10 @@ section.verse{margin-top:30px}
 .a{font-size:13.5px;color:var(--ink)}
 .t{font-size:14.5px;min-width:0}
 .t.none{color:var(--muted)}
+.badge{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--rubric);border:1px solid currentColor;border-radius:3px;padding:0 4px;margin-left:6px;vertical-align:1px;white-space:nowrap}
+.orig{display:block;font-size:12.5px;color:var(--muted);margin-top:2px}
+.orig .g{font-family:var(--greek);font-size:14px}
+.note{display:block;font-size:12.5px;color:var(--muted);font-style:italic;margin-top:2px}
 .missing{margin-top:10px;font-size:13.5px;color:var(--muted)}
 .missing b{font-weight:500;color:var(--ink)}
 .missing .g{font-family:var(--greek);font-size:16px;color:var(--ink)}
@@ -108,7 +112,8 @@ footer button{border:0;background:none;color:var(--rubric);font:inherit;cursor:p
 
   <footer>
     <div><span id="src">Загружаю словарь…</span> <button id="reload" type="button">Обновить из таблицы</button></div>
-    <div>Текст и морфология: Rahlfs (1935) в разметке CATSS (LXXM, R. Kraft) по данным проекта LXX-Rahlfs-1935 (E. Wong, CC BY-NC-SA 4.0). В CATSS нет пунктуации; знаки перенесены из издания Swete (1909) по совпадению слов, совпало около 95 % слов. Где тексты расходятся, знак может стоять не на месте или отсутствовать: сверяйтесь с изданием.</div>
+    <div id="text-info">Загружаю текст…</div>
+    <div>Текст и морфология: Rahlfs (1935) в разметке CATSS (LXXM, R. Kraft) по данным проекта LXX-Rahlfs-1935 (E. Wong, CC BY-NC-SA 4.0). В CATSS нет пунктуации; знаки перенесены из издания Swete (1909) по совпадению слов, совпало около 95 % слов. Где тексты расходятся, знак может стоять не на месте или отсутствовать: сверяйтесь с изданием. Правки команды хранятся в листе «Textus» той же таблицы; слова, разобранные иначе, чем в CATSS, помечены «испр.», добавленные — «доб.».</div>
   </footer>
 </div>
 
@@ -207,6 +212,82 @@ const cmp = (a, b) => a[0] - b[0] || a[1] - b[1];
 
 let dict = new Map();
 let shown = [];
+// текст и разбор: лист «Textus» той же таблицы, по главе за запрос; встроенная копия — запасной вариант
+const TEXT_TAB = 'Textus';
+const live = new Map();     // глава -> Map(«7:14» -> [слова]) или null, если лист прочитать не удалось
+const pending = new Map();
+let textErr = '';
+const NFC = s => s.normalize('NFC');
+
+function snapWords(key){
+  return VERSES[key].map(w => {
+    const lemma = LEM[w[w.length - 2]], desc = DESC[w[w.length - 1]], punct = w.length === 4 ? w[1] : '';
+    return {form: w[0], punct, lemma, desc, nota: '', orig: {lemma, desc, punct}};
+  });
+}
+const chOf = key => +key.split(':')[0];
+function getVerse(key){
+  const m = live.get(chOf(key));
+  if (m) return m.get(key) || [];
+  return VERSES[key] ? snapWords(key) : [];
+}
+
+function loadChapter(ch){
+  if (live.has(ch)) return Promise.resolve();
+  if (pending.has(ch)) return pending.get(ch);
+  const p = (async () => {
+    try{
+      const tq = `select * where A = ${ch}`;
+      const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&headers=1&sheet=${encodeURIComponent(TEXT_TAB)}&tq=${encodeURIComponent(tq)}&_=${Date.now()}`;
+      const res = await fetch(url, {cache:'no-store'});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const rows = parseCSV(await res.text());
+      const head = (rows[0] || []).map(h => h.trim().toLowerCase());
+      const col = n => head.indexOf(n.toLowerCase());
+      const ix = {c: col('Caput'), v: col('Versus'), n: col('Nr'), f: col('Forma'), p: col('Interpunctio'),
+        l: col('Lemma'), a: col('Analysis'), no: col('Nota'),
+        ol: col('CATSS_Lemma'), oa: col('CATSS_Analysis'), op: col('CATSS_Interpunctio')};
+      // без этих столбцов это не лист Textus (Google отдаёт первый лист, если нужного нет)
+      if (ix.c < 0 || ix.v < 0 || ix.f < 0) throw new Error(`в таблице нет листа «${TEXT_TAB}»`);
+      const cell = (r, i) => i < 0 ? '' : (r[i] || '').trim();
+      const m = new Map();
+      for (const r of rows.slice(1)){
+        const form = cell(r, ix.f), v = parseInt(cell(r, ix.v));
+        if (!form || !v) continue;
+        const key = `${ch}:${v}`;
+        const nr = parseFloat(cell(r, ix.n).replace(',', '.'));
+        const ol = cell(r, ix.ol), oa = cell(r, ix.oa);
+        const w = {nr: isNaN(nr) ? 1e9 : nr, form, punct: cell(r, ix.p), lemma: NFC(cell(r, ix.l)),
+          desc: cell(r, ix.a), nota: cell(r, ix.no),
+          orig: (ol || oa) ? {lemma: NFC(ol), desc: oa, punct: cell(r, ix.op)} : null};
+        if (!m.has(key)) m.set(key, []);
+        m.get(key).push(w);
+      }
+      if (!m.size) throw new Error(`в листе «${TEXT_TAB}» нет главы ${ch}`);
+      for (const ws of m.values()) ws.sort((a, b) => a.nr - b.nr);
+      live.set(ch, m);
+      textErr = '';
+    }catch(e){
+      live.set(ch, null);
+      textErr = e.message;
+    }finally{
+      pending.delete(ch);
+    }
+  })();
+  pending.set(ch, p);
+  return p;
+}
+const chaptersOf = keys => [...new Set(keys.map(chOf))];
+const loadFor = keys => Promise.all(chaptersOf(keys).map(loadChapter));
+
+function textInfo(keys){
+  const chs = chaptersOf(keys);
+  if (!chs.length) return;
+  const fromSheet = chs.every(c => live.get(c));
+  $('text-info').textContent = fromSheet
+    ? `Текст и разбор из листа «${TEXT_TAB}» Google-таблицы.`
+    : `Показана встроенная копия разбора CATSS без правок команды: ${textErr || 'лист «' + TEXT_TAB + '» прочитать не удалось'}.`;
+}
 
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
@@ -260,6 +341,7 @@ async function loadLive(){
     buildDict(SNAPSHOT);
     $('src').textContent = `Переводы из снимка словаря от ${SNAPSHOT_DATE}: живую таблицу прочитать не удалось.`;
   }
+  await loadFor(shown);
   render(shown);
 }
 
@@ -283,17 +365,25 @@ function resolve(q){
 }
 
 function verseHTML(key){
-  const ws = VERSES[key];
+  const W = getVerse(key);
   const id = key.replace(':','-');
-  const text = ws.map((w, i) => {
-    const p = w.length === 4 ? w[1] : '';
-    return `<span class="w" tabindex="0" data-v="${id}" data-i="${i}">${esc(w[0])}</span>${esc(p)}`;
-  }).join(' ');
-  const rows = ws.map((w, i) => {
-    const lemma = LEM[w[w.length - 2]], desc = DESC[w[w.length - 1]];
-    const hit = lookup(lemma);
+  const text = W.map((w, i) =>
+    `<span class="w" tabindex="0" data-v="${id}" data-i="${i}">${esc(w.form)}</span>${esc(w.punct)}`).join(' ');
+  const rows = W.map((w, i) => {
+    const hit = lookup(w.lemma);
     const tr = hit && hit.s ? `<div class="t">${esc(hit.s)}</div>` : `<div class="t none">${hit ? 'значение не записано' : '—'}</div>`;
-    return `<div class="wr" id="w-${id}-${i}"><div class="f">${esc(w[0])}</div><div class="l">${esc(lemma)}</div><div class="a">${esc(desc)}</div>${tr}</div>`;
+    let a = esc(w.desc);
+    const o = w.orig;
+    if (!o) a += `<span class="badge" title="Слова нет в CATSS, добавлено командой">доб.</span>`;
+    else {
+      const was = [];
+      if (o.lemma !== w.lemma) was.push(`<span class="g">${esc(o.lemma)}</span>`);
+      if (o.desc !== w.desc) was.push(esc(o.desc));
+      if (o.punct !== w.punct) was.push('знак: ' + (o.punct ? esc(o.punct) : 'нет'));
+      if (was.length) a += `<span class="badge" title="Исправлено командой">испр.</span><span class="orig">CATSS: ${was.join('; ')}</span>`;
+    }
+    if (w.nota) a += `<span class="note">${esc(w.nota)}</span>`;
+    return `<div class="wr" id="w-${id}-${i}"><div class="f">${esc(w.form)}</div><div class="l">${esc(w.lemma)}</div><div class="a">${a}</div>${tr}</div>`;
   }).join('');
   return `<section class="verse" id="v-${id}"><h2>Ис ${key}</h2><p class="text" lang="grc">${text}</p>
     <div class="words"><div class="wr head"><div>форма</div><div>лемма</div><div>разбор</div><div>перевод</div></div>${rows}</div></section>`;
@@ -304,10 +394,10 @@ function render(keys){
   const out = $('out');
   if (!keys.length){ out.innerHTML = ''; return; }
   const missing = [];
-  for (const k of keys) for (const w of VERSES[k]){
-    const lemma = LEM[w[w.length - 2]];
-    if (!lookup(lemma) && !missing.includes(lemma)) missing.push(lemma);
+  for (const k of keys) for (const w of getVerse(k)){
+    if (w.lemma && !lookup(w.lemma) && !missing.includes(w.lemma)) missing.push(w.lemma);
   }
+  textInfo(keys);
   out.innerHTML = keys.map(verseHTML).join('') + (missing.length
     ? `<p class="missing"><b>Нет в словаре (${missing.length}):</b> <span class="g">${missing.map(esc).join(', ')}</span></p>` : '');
 }
@@ -319,13 +409,19 @@ function hashFor(keys){
   return '';
 }
 
-function show(q, fromHash){
+async function show(q, fromHash){
   const keys = resolve(q);
   if (keys === null){ $('hint').textContent = 'Не понял ссылку. Примеры: 7:14, 7:14-16, 7:14-8:2, 7.'; return; }
   if (!keys.length){ $('hint').textContent = `В Исайе нет «${q}». В книге 66 глав.`; return; }
   $('hint').innerHTML = keys.length === 1 ? 'Стих Ис ' + keys[0] + '.' :
     `Ис ${keys[0]}–${keys[keys.length-1]}, стихов: ${keys.length}.`;
   $('ref').value = q;
+  shown = keys;
+  if (chaptersOf(keys).some(c => !live.has(c))){
+    $('out').innerHTML = `<p class="empty">Загружаю текст из таблицы…</p>`;
+    await loadFor(keys);
+    if (shown !== keys) return;   // пользователь уже открыл другое место
+  }
   render(keys);
   const h = hashFor(keys);
   if (!fromHash){
@@ -344,15 +440,15 @@ function stepBy(d){
 function fromHash(){
   const h = location.hash.slice(1);
   let m;
-  if ((m = h.match(/^v(\d+)-(\d+)$/))) return show(`${m[1]}:${m[2]}`, true);
-  if ((m = h.match(/^c(\d+)$/))) return show(m[1], true);
+  if ((m = h.match(/^v(\d+)-(\d+)$/))) { show(`${m[1]}:${m[2]}`, true); return true; }
+  if ((m = h.match(/^c(\d+)$/))) { show(m[1], true); return true; }
   return false;
 }
 
 $('go').addEventListener('submit', e => { e.preventDefault(); const q = $('ref').value.trim(); if (q) show(q); });
 $('prev').addEventListener('click', () => stepBy(-1));
 $('next').addEventListener('click', () => stepBy(1));
-$('reload').addEventListener('click', loadLive);
+$('reload').addEventListener('click', () => { live.clear(); loadLive(); });
 window.addEventListener('hashchange', fromHash);
 document.addEventListener('keydown', e => {
   if (e.target === $('ref')) return;
